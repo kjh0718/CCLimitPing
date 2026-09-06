@@ -7,18 +7,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/creack/pty"
-
 	"github.com/wavever/CCLimitPing/internal/activity"
 	"github.com/wavever/CCLimitPing/internal/auth"
 	"github.com/wavever/CCLimitPing/internal/config"
+	"github.com/wavever/CCLimitPing/internal/terminal"
 	"github.com/wavever/CCLimitPing/internal/usage"
 )
 
@@ -272,58 +270,55 @@ func (c *Claude) Trigger(ctx context.Context, dryRun bool) (*TriggerResult, erro
 		return res, nil
 	}
 
-	cmd := exec.CommandContext(ctx, "claude", args...)
-	ptmx, err := pty.Start(cmd)
+	sess, err := terminal.Start(ctx, "claude", args)
 	if err != nil {
 		return res, fmt.Errorf("claude interactive failed to start: %w", err)
 	}
-	defer ptmx.Close()
+	defer sess.Close()
 
 	output := &limitedBuffer{limit: 4096}
 	go func() {
-		_, _ = io.Copy(output, ptmx)
+		_, _ = io.Copy(output, sess)
 	}()
 
 	done := make(chan error, 1)
 	go func() {
-		done <- cmd.Wait()
+		done <- sess.Wait()
 	}()
 
 	// Phase 1: wait for the TUI to render and settle so the submit Enter lands on
 	// a ready prompt holding the prefilled message.
-	if terminal, err := claudeAwait(ctx, cmd, ptmx, output, done, claudeStartupTimeout,
-		func(idle, _ time.Duration) bool { return idle >= claudeStartupSettle }); terminal {
+	if term, err := claudeAwait(ctx, sess, output, done, claudeStartupTimeout,
+		func(idle, _ time.Duration) bool { return idle >= claudeStartupSettle }); term {
 		return res, err
 	}
 
 	// Submit the prefilled prompt. This is the model request that anchors the 5h
 	// window; the previous implementation never sent it, so the window never
 	// started even though the session exited cleanly.
-	if _, werr := ptmx.Write([]byte("\r")); werr != nil {
+	if _, werr := sess.Write([]byte("\r")); werr != nil {
 		return res, fmt.Errorf("claude interactive failed to submit prompt: %w: %s", werr, truncate(output.Bytes(), 300))
 	}
 
 	// Phase 2: let the turn run until its output goes quiet (bounded by a floor
 	// and a hard cap), so we don't cancel the in-flight request by exiting early.
-	if terminal, err := claudeAwait(ctx, cmd, ptmx, output, done, claudeTurnMaxWait,
+	if term, err := claudeAwait(ctx, sess, output, done, claudeTurnMaxWait,
 		func(idle, elapsed time.Duration) bool {
 			return elapsed >= claudeTurnMinWait && idle >= claudeTurnQuiet
-		}); terminal {
+		}); term {
 		return res, err
 	}
 
 	// Phase 3: quit. The window is already anchored, so a messy shutdown here
 	// must not fail the ping.
-	_, _ = ptmx.Write([]byte("/exit\r"))
+	_, _ = sess.Write([]byte("/exit\r"))
 	select {
 	case err := <-done:
 		return res, claudeInteractiveErr(err, output)
 	case <-ctx.Done():
-		return res, claudeInteractiveCancel(ctx, cmd, ptmx, done, output)
+		return res, claudeInteractiveCancel(ctx, sess, done, output)
 	case <-time.After(claudeExitGrace):
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
+		_ = sess.Kill()
 		select {
 		case <-done:
 		case <-time.After(time.Second):
@@ -340,7 +335,7 @@ func (c *Claude) Trigger(ctx context.Context, dryRun bool) (*TriggerResult, erro
 // PTY output and elapsed is the time since this phase began. It returns
 // terminal=true (with an error to propagate) only if the process exits or ctx is
 // cancelled first; otherwise terminal=false and the caller continues.
-func claudeAwait(ctx context.Context, cmd *exec.Cmd, ptmx *os.File, output *limitedBuffer, done <-chan error, maxWait time.Duration, ready func(idle, elapsed time.Duration) bool) (bool, error) {
+func claudeAwait(ctx context.Context, sess terminal.Session, output *limitedBuffer, done <-chan error, maxWait time.Duration, ready func(idle, elapsed time.Duration) bool) (bool, error) {
 	start := time.Now()
 	deadline := time.After(maxWait)
 	ticker := time.NewTicker(claudePollInterval)
@@ -350,7 +345,7 @@ func claudeAwait(ctx context.Context, cmd *exec.Cmd, ptmx *os.File, output *limi
 		case err := <-done:
 			return true, claudeInteractiveErr(err, output)
 		case <-ctx.Done():
-			return true, claudeInteractiveCancel(ctx, cmd, ptmx, done, output)
+			return true, claudeInteractiveCancel(ctx, sess, done, output)
 		case <-deadline:
 			return false, nil
 		case <-ticker.C:
@@ -386,11 +381,9 @@ func claudeSubscriptionErrorFromOutput(raw []byte) error {
 	return nil
 }
 
-func claudeInteractiveCancel(ctx context.Context, cmd *exec.Cmd, ptmx *os.File, done <-chan error, output *limitedBuffer) error {
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
-	_ = ptmx.Close()
+func claudeInteractiveCancel(ctx context.Context, sess terminal.Session, done <-chan error, output *limitedBuffer) error {
+	_ = sess.Kill()
+	_ = sess.Close()
 	select {
 	case <-done:
 	case <-time.After(time.Second):

@@ -1,0 +1,116 @@
+//go:build !windows
+
+package terminal
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// TestStartRunsCommandAndReadsOutput starts a trivial shell command under a real
+// PTY, reads its output through the Session, and confirms Wait returns cleanly.
+// It uses `sh -c echo` (always present on Unix), never a real CLI or credentials.
+func TestStartRunsCommandAndReadsOutput(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const marker = "pty-test-output"
+	sess, err := Start(ctx, "sh", []string{"-c", "echo " + marker})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer sess.Close()
+
+	// Drain the PTY master concurrently. Reading a master after the child exits
+	// can return EIO on Linux (vs a clean EOF on macOS), so the read error is
+	// intentionally ignored — the assertion is on the captured bytes.
+	var (
+		mu  sync.Mutex
+		buf bytes.Buffer
+	)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		b := make([]byte, 1024)
+		for {
+			n, rerr := sess.Read(b)
+			if n > 0 {
+				mu.Lock()
+				buf.Write(b[:n])
+				mu.Unlock()
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}()
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- sess.Wait() }()
+
+	select {
+	case err := <-waitErr:
+		if err != nil {
+			t.Fatalf("Wait returned an error for a clean exit: %v", err)
+		}
+	case <-ctx.Done():
+		_ = sess.Kill()
+		t.Fatalf("timed out waiting for the command: %v", ctx.Err())
+	}
+
+	// Closing the master unblocks the reader if the child's exit didn't.
+	_ = sess.Close()
+	select {
+	case <-readDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader did not finish after Close (possible hang)")
+	}
+
+	mu.Lock()
+	got := buf.String()
+	mu.Unlock()
+	if !strings.Contains(got, marker) {
+		t.Fatalf("PTY output %q does not contain %q", got, marker)
+	}
+}
+
+// TestKillTerminatesCommand confirms Kill stops a long-running child and that
+// Wait then returns, all within the context deadline (no hang, no leaked child).
+func TestKillTerminatesCommand(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	sess, err := Start(ctx, "sh", []string{"-c", "sleep 60"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer sess.Close()
+
+	// Keep the master drained so the child never blocks on a full PTY buffer.
+	go func() {
+		b := make([]byte, 512)
+		for {
+			if _, rerr := sess.Read(b); rerr != nil {
+				return
+			}
+		}
+	}()
+
+	if err := sess.Kill(); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- sess.Wait() }()
+	select {
+	case <-waitErr:
+		// A killed process makes Wait return a non-nil error; either way it
+		// must return, which is what this test asserts.
+	case <-ctx.Done():
+		t.Fatalf("Wait did not return after Kill (possible hang): %v", ctx.Err())
+	}
+}
