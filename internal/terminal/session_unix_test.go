@@ -23,7 +23,23 @@ func TestStartRunsCommandAndReadsOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer sess.Close()
+	// Close the PTY session exactly once. The guard keeps the in-body close
+	// (which unblocks the reader) and the cleanup safety net mutually
+	// exclusive, so the session is never closed twice; the close error is
+	// reported at the in-body call rather than dropped.
+	closed := false
+	closeSession := func() error {
+		if closed {
+			return nil
+		}
+		closed = true
+		return sess.Close()
+	}
+	t.Cleanup(func() {
+		if err := closeSession(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
 
 	// Drain the PTY master concurrently. Reading a master after the child exits
 	// can return EIO on Linux (vs a clean EOF on macOS), so the read error is
@@ -63,7 +79,9 @@ func TestStartRunsCommandAndReadsOutput(t *testing.T) {
 	}
 
 	// Closing the master unblocks the reader if the child's exit didn't.
-	_ = sess.Close()
+	if err := closeSession(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
 	select {
 	case <-readDone:
 	case <-time.After(2 * time.Second):
@@ -88,7 +106,12 @@ func TestKillTerminatesCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer sess.Close()
+	// Single, error-checked close (no second Close call anywhere in this test).
+	defer func() {
+		if err := sess.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
 
 	// Keep the master drained so the child never blocks on a full PTY buffer.
 	go func() {
