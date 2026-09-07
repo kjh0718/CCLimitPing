@@ -1,8 +1,9 @@
 // Package terminal abstracts launching a child process attached to a
 // pseudo-terminal, so provider triggers can drive an interactive CLI (Claude
 // Code, Codex) without depending on a specific PTY backend. Unix/macOS uses a
-// real PTY (github.com/creack/pty); Windows is not supported yet (a ConPTY
-// backend is tracked separately) and returns an error from Start.
+// real PTY (github.com/creack/pty); Windows uses a ConPTY pseudoconsole, with
+// the child and its descendants held in a job object so the whole tree can be
+// torn down.
 package terminal
 
 import (
@@ -31,7 +32,8 @@ type Session interface {
 
 // Start launches name (with args) attached to a new pseudo-terminal and returns
 // a Session that owns the child's lifecycle. Cancelling ctx terminates the
-// child. On platforms without PTY support it returns an error and a nil Session.
+// child. It returns an error and a nil Session if the terminal or the child
+// cannot be created.
 func Start(ctx context.Context, name string, args []string) (Session, error) {
 	return start(ctx, name, args)
 }
