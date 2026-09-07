@@ -4,8 +4,12 @@ package terminal
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -116,13 +120,15 @@ func startAttached(cmd *exec.Cmd, hpc windows.Handle, job *jobObject) (windows.H
 	si.Flags |= windows.STARTF_USESTDHANDLES
 	si.StdInput, si.StdOutput, si.StdErr = 0, 0, 0
 
-	appName, err := windows.UTF16PtrFromString(cmd.Path)
+	app, line, err := prepareWindowsCommand(cmd)
 	if err != nil {
 		return 0, err
 	}
-	// ComposeCommandLine applies the quoting rules the Windows CRT parses back,
-	// so an argument containing spaces or quotes survives the round trip.
-	cmdLine, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(cmd.Args))
+	appName, err := windows.UTF16PtrFromString(app)
+	if err != nil {
+		return 0, err
+	}
+	cmdLine, err := windows.UTF16PtrFromString(line)
 	if err != nil {
 		return 0, err
 	}
@@ -162,6 +168,132 @@ func startAttached(cmd *exec.Cmd, hpc windows.Handle, job *jobObject) (windows.H
 	}
 	_ = windows.CloseHandle(pi.Thread)
 	return pi.Process, nil
+}
+
+// prepareWindowsCommand decides how CreateProcess should launch cmd: what to
+// pass as lpApplicationName, and the command line to go with it.
+//
+// A native image is launched directly, with the arguments quoted the way the
+// Windows CRT parses them back. A batch file is not an image, and CreateProcess
+// documents the only supported way to run one: set lpApplicationName to the
+// command interpreter and pass it /c plus the batch file. Some Windows builds do
+// run a batch file handed straight to CreateProcess, which is why this went
+// unnoticed, but nothing promises that and it is the wrong shape regardless —
+// cmd.exe re-parses the command line under rules the CRT quoting does not
+// account for, so an argument containing cmd metacharacters is not carried
+// safely. Going through the interpreter explicitly makes the launch documented
+// and lets the arguments be quoted for the parse that actually happens.
+//
+// This matters here because the npm-installed CLIs this package drives are .cmd
+// shims on Windows, so the batch path is the common one, not the exotic one.
+func prepareWindowsCommand(cmd *exec.Cmd) (appName, cmdLine string, err error) {
+	switch strings.ToLower(filepath.Ext(cmd.Path)) {
+	case ".cmd", ".bat":
+		return batchCommand(cmd.Path, cmd.Args[1:])
+	default:
+		return cmd.Path, windows.ComposeCommandLine(cmd.Args), nil
+	}
+}
+
+// batchCommand builds the interpreter invocation that runs a .cmd/.bat script.
+//
+// The command line is `<comspec> /d /v:off /s /c "<script> <args...>"`:
+//   - /d skips any AutoRun command the machine has configured, so the session
+//     starts from a predictable shell,
+//   - /v:off turns off delayed expansion, so !NAME! stays literal no matter what
+//     the registry's DelayedExpansion default or an inherited setting says,
+//   - /c runs the command and exits,
+//   - /s settles how the quotes are read: with /s, cmd strips the first and last
+//     quote of everything after /c and takes the rest as-is. That is what the one
+//     extra wrapping pair is for — it is consumed by that rule, leaving the
+//     script and each argument still carrying their own quotes.
+//
+// Composing the whole line with ComposeCommandLine instead would break both
+// halves of that: it escapes an embedded quote as \" — a backslash cmd does not
+// honour, so the quote toggles and the rest of the argument becomes live command
+// text — and it leaves no wrapping pair, so the /s rule eats the quotes around a
+// script path that has a space in it and cmd tries to run the first word alone.
+func batchCommand(script string, args []string) (appName, cmdLine string, err error) {
+	inner, err := quoteBatchArg(script)
+	if err != nil {
+		return "", "", fmt.Errorf("batch script path %q: %w", script, err)
+	}
+	for i, a := range args {
+		q, err := quoteBatchArg(a)
+		if err != nil {
+			// The argument's value is deliberately left out of the message: what
+			// arrives here is the configured prompt and extra args, which are the
+			// user's own text. The position is enough to find it in the config.
+			return "", "", fmt.Errorf("argument %d of %d passed to batch file %q: %w", i+1, len(args), script, err)
+		}
+		inner += " " + q
+	}
+
+	comspec := commandInterpreter()
+	prefix := windows.ComposeCommandLine([]string{comspec, "/d", "/v:off", "/s", "/c"})
+	return comspec, prefix + ` "` + inner + `"`, nil
+}
+
+// commandInterpreter returns the command processor to run batch files with. It
+// is COMSPEC, as documented, falling back to the system cmd.exe by absolute path
+// so that an empty or missing COMSPEC cannot turn into a bare-name lookup that
+// resolves against the current directory or PATH.
+func commandInterpreter() string {
+	if comspec := os.Getenv("COMSPEC"); comspec != "" {
+		return comspec
+	}
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = `C:\Windows`
+	}
+	return filepath.Join(root, "System32", "cmd.exe")
+}
+
+// quoteBatchArg quotes one token of the command cmd.exe parses once /s has taken
+// the wrapping quotes off. The token is wrapped in quotes and any quote inside it
+// is doubled, which is the escape cmd understands (and, for the npm shims that
+// forward %* to a CRT program, the escape that program parses back too).
+//
+// The wrapping is what contains cmd's own metacharacters: inside quotes & | < >
+// ( ) and ^ are ordinary text, so an argument cannot end the command it belongs
+// to and start another one.
+//
+// Two things cannot be carried across at all, and are refused rather than
+// delivered as something other than what was asked for:
+//
+//   - A NUL or a newline, which a command line has no way to represent; passing
+//     one on would silently truncate the argument at that byte.
+//
+//   - A percent sign. cmd expands %NAME% while it parses, before the script ever
+//     runs, and a bare % has no escape inside a quoted command-line token: ^%
+//     only works outside quotes and %% only inside a script file. /v:off does not
+//     help — that governs !NAME! and nothing else. So a literal % cannot reach
+//     the script, and the alternative to refusing is handing the script a value
+//     silently replaced by an environment variable's contents, which is both a
+//     lost argument and, depending on what that variable holds, more shell syntax
+//     arriving where an argument was meant.
+//
+// Neither limit applies to a native executable: its arguments never pass through
+// cmd, so they go through ComposeCommandLine untouched.
+func quoteBatchArg(arg string) (string, error) {
+	if strings.ContainsAny(arg, "\x00\r\n") {
+		return "", errors.New("cannot be passed to a batch file: it contains a NUL or a newline, which a command line cannot represent")
+	}
+	if strings.Contains(arg, "%") {
+		return "", errors.New("cannot be passed to a batch file: it contains %, which cmd.exe expands as an environment variable reference before the script runs")
+	}
+	var b strings.Builder
+	b.Grow(len(arg) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(arg); i++ {
+		if arg[i] == '"' {
+			b.WriteString(`""`)
+			continue
+		}
+		b.WriteByte(arg[i])
+	}
+	b.WriteByte('"')
+	return b.String(), nil
 }
 
 // wait is the single waiter for the child. It records the exit status, starts
