@@ -3,6 +3,7 @@
 package terminal
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -149,11 +150,20 @@ func (p *pipeHandle) Write(b []byte) (int, error) {
 // isPipeEOF reports whether err means the far end of the pipe is gone, which is
 // the normal way a ConPTY session ends: the console host closes its side when
 // the pseudoconsole is closed after the child exits.
+//
+// The comparisons go through errors.Is rather than testing err directly. The
+// callers hand over what ReadFile and WriteFile returned, unwrapped, so today
+// the two are equivalent — but a syscall error that picks up any context on its
+// way here would otherwise stop being recognised, and silently turn the end of a
+// session into a read failure.
 func isPipeEOF(err error) bool {
-	switch err {
-	case windows.ERROR_BROKEN_PIPE, windows.ERROR_PIPE_NOT_CONNECTED, windows.ERROR_HANDLE_EOF:
+	switch {
+	case errors.Is(err, windows.ERROR_BROKEN_PIPE),
+		errors.Is(err, windows.ERROR_PIPE_NOT_CONNECTED),
+		errors.Is(err, windows.ERROR_HANDLE_EOF):
 		return true
-	case windows.ERROR_OPERATION_ABORTED, windows.ERROR_INVALID_HANDLE:
+	case errors.Is(err, windows.ERROR_OPERATION_ABORTED),
+		errors.Is(err, windows.ERROR_INVALID_HANDLE):
 		// The session was torn down underneath the call.
 		return true
 	}

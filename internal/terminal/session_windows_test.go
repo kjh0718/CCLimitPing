@@ -5,6 +5,7 @@ package terminal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -540,6 +541,46 @@ func TestPrepareWindowsCommandRejectsUnquotableBatchArg(t *testing.T) {
 	cmd := exec.Command(`C:\tools\shim.cmd`, "line one\r\nline two")
 	if _, line, err := prepareWindowsCommand(cmd); err == nil {
 		t.Fatalf("prepareWindowsCommand = %q, want an error for an argument with a newline", line)
+	}
+}
+
+// TestIsPipeEOF pins the classification the reader depends on, including for a
+// syscall error that arrived wrapped. Getting a wrapped end-of-input wrong would
+// not look like a missing case: it would surface as a read failure at the end of
+// every session, in place of the clean EOF the providers drain towards.
+func TestIsPipeEOF(t *testing.T) {
+	endOfInput := []error{
+		windows.ERROR_BROKEN_PIPE,
+		windows.ERROR_PIPE_NOT_CONNECTED,
+		windows.ERROR_HANDLE_EOF,
+		windows.ERROR_OPERATION_ABORTED,
+		windows.ERROR_INVALID_HANDLE,
+	}
+	for _, target := range endOfInput {
+		if !isPipeEOF(target) {
+			t.Errorf("isPipeEOF(%v) = false, want true", target)
+		}
+		wrapped := fmt.Errorf("ReadFile: %w", target)
+		if !isPipeEOF(wrapped) {
+			t.Errorf("isPipeEOF(%v) = false, want true for a wrapped error", wrapped)
+		}
+		if twice := fmt.Errorf("draining session: %w", wrapped); !isPipeEOF(twice) {
+			t.Errorf("isPipeEOF(%v) = false, want true through two layers of wrapping", twice)
+		}
+	}
+
+	// Everything else stays a real error, wrapped or not — widening this to any
+	// syscall failure would hide a broken session behind a clean EOF.
+	for _, other := range []error{
+		nil,
+		io.EOF,
+		errors.New("boom"),
+		windows.ERROR_ACCESS_DENIED,
+		fmt.Errorf("ReadFile: %w", windows.ERROR_ACCESS_DENIED),
+	} {
+		if isPipeEOF(other) {
+			t.Errorf("isPipeEOF(%v) = true, want false", other)
+		}
 	}
 }
 
