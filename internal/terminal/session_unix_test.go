@@ -137,3 +137,50 @@ func TestKillTerminatesCommand(t *testing.T) {
 		t.Fatalf("Wait did not return after Kill (possible hang): %v", ctx.Err())
 	}
 }
+
+// TestKillAfterWaitSucceeds pins the Session contract's promise that Kill is
+// safe once the child is already gone. After Wait reaps it, the underlying
+// Process.Kill reports os.ErrProcessDone, which must not surface as a failure —
+// the Windows backend returns nil in the same situation (TestSessionKill), and
+// the two backends have to stay interchangeable for the provider triggers.
+func TestKillAfterWaitSucceeds(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	sess, err := Start(ctx, "sh", []string{"-c", "exit 0"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Single, error-checked close (no second Close call anywhere in this test).
+	defer func() {
+		if err := sess.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	// Keep the master drained so the child never blocks on a full PTY buffer.
+	go func() {
+		b := make([]byte, 512)
+		for {
+			if _, rerr := sess.Read(b); rerr != nil {
+				return
+			}
+		}
+	}()
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- sess.Wait() }()
+	select {
+	case err := <-waitErr:
+		if err != nil {
+			t.Fatalf("Wait returned an error for a clean exit: %v", err)
+		}
+	case <-ctx.Done():
+		_ = sess.Kill()
+		t.Fatalf("Wait did not return for a command that exits immediately: %v", ctx.Err())
+	}
+
+	if err := sess.Kill(); err != nil {
+		t.Fatalf("Kill after Wait = %v, want nil for an already-exited child", err)
+	}
+}

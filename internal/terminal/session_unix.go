@@ -4,6 +4,7 @@ package terminal
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 
@@ -34,9 +35,18 @@ func (s *unixSession) Write(p []byte) (int, error) { return s.ptmx.Write(p) }
 func (s *unixSession) Close() error                { return s.ptmx.Close() }
 func (s *unixSession) Wait() error                 { return s.cmd.Wait() }
 
+// Kill force-terminates the child. Once Wait has reaped it the process handle is
+// marked done and Process.Kill reports os.ErrProcessDone, which is the state Kill
+// is asked to reach, not a failure to reach it — the Session contract makes Kill
+// safe on an already-gone child, and the Windows backend behaves that way because
+// terminating a job whose members have exited succeeds. Every other error is a
+// real failure to terminate and is returned.
 func (s *unixSession) Kill() error {
 	if s.cmd.Process == nil {
 		return nil
 	}
-	return s.cmd.Process.Kill()
+	if err := s.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return nil
 }
