@@ -10,7 +10,7 @@
 [![CI](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml/badge.svg)](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/wavever/CCLimitPing?include_prereleases&sort=semver)](https://github.com/wavever/CCLimitPing/releases)
 ![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 
 Start the next **Claude Code**, **Codex**, or **Spark** rate-limit window the
 moment the previous one resets.
@@ -153,6 +153,12 @@ macOS/Linux, `.zip` for Windows):
 tar -xzf limitping_darwin_arm64.tar.gz
 sudo mv limitping /usr/local/bin/
 ```
+
+**Windows** — use the manual download above (`limitping_windows_amd64.zip` or
+`limitping_windows_arm64.zip`). The Claude Code and Codex interactive triggers
+run natively through a ConPTY pseudo-console, including CLIs installed as
+`.cmd`/`.bat` shims. Not every command is available on Windows yet —
+`limitping continue` still reports that it is unsupported.
 
 **Homebrew** (macOS / Linux) — `brew install wavever/tap/limitping`
 _(works once the Homebrew tap is set up — see `.goreleaser.yaml`)._

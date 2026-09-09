@@ -10,7 +10,7 @@
 [![CI](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml/badge.svg)](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/wavever/CCLimitPing?include_prereleases&sort=semver)](https://github.com/wavever/CCLimitPing/releases)
 ![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 
 在上一个窗口重置的瞬间,立即启动下一个 **Claude Code** / **Codex** / **Spark** 限额窗口。
 
@@ -137,6 +137,11 @@ limitping uninstall
 tar -xzf limitping_darwin_arm64.tar.gz
 sudo mv limitping /usr/local/bin/
 ```
+
+**Windows** —— 使用上面的手动下载(`limitping_windows_amd64.zip` 或
+`limitping_windows_arm64.zip`)。Claude Code 与 Codex 的交互式触发
+通过原生 ConPTY 伪控制台运行,也支持以 `.cmd`/`.bat` shim 安装的 CLI。
+Windows 上并非所有命令都已可用 —— `limitping continue` 仍会提示暂不支持。
 
 **Homebrew**(macOS / Linux)—— `brew install wavever/tap/limitping`
 _(配好 Homebrew tap 后可用;见 `.goreleaser.yaml`)。_

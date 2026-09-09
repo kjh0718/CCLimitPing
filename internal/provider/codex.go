@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,11 +19,11 @@ import (
 	"unicode"
 
 	"github.com/BurntSushi/toml"
-	"github.com/creack/pty"
 
 	"github.com/wavever/CCLimitPing/internal/activity"
 	"github.com/wavever/CCLimitPing/internal/auth"
 	"github.com/wavever/CCLimitPing/internal/config"
+	"github.com/wavever/CCLimitPing/internal/terminal"
 	"github.com/wavever/CCLimitPing/internal/usage"
 )
 
@@ -569,34 +568,33 @@ func triggerCodex(ctx context.Context, cfg config.ProviderConfig, dryRun bool) (
 		return res, nil
 	}
 
-	cmd := exec.CommandContext(ctx, "codex", args...)
-	ptmx, err := pty.Start(cmd)
+	sess, err := terminal.Start(ctx, "codex", args)
 	if err != nil {
 		return res, fmt.Errorf("codex interactive failed to start: %w", err)
 	}
-	defer ptmx.Close()
+	defer sess.Close()
 
 	output := &limitedBuffer{limit: 4096}
 	go func() {
-		_, _ = io.Copy(output, ptmx)
+		_, _ = io.Copy(output, sess)
 	}()
 
 	done := make(chan error, 1)
 	go func() {
-		done <- cmd.Wait()
+		done <- sess.Wait()
 	}()
 
-	if terminal, err := codexAwait(ctx, cmd, ptmx, output, done, codexTurnMaxWait,
+	if term, err := codexAwait(ctx, sess, output, done, codexTurnMaxWait,
 		func(idle, elapsed time.Duration) bool {
 			return elapsed >= codexTurnMinWait && idle >= codexTurnQuiet
-		}); terminal {
+		}); term {
 		return res, err
 	}
 
-	return res, codexInteractiveStop(ctx, cmd, ptmx, done, output)
+	return res, codexInteractiveStop(ctx, sess, done, output)
 }
 
-func codexAwait(ctx context.Context, cmd *exec.Cmd, ptmx *os.File, output *limitedBuffer, done <-chan error, maxWait time.Duration, ready func(idle, elapsed time.Duration) bool) (bool, error) {
+func codexAwait(ctx context.Context, sess terminal.Session, output *limitedBuffer, done <-chan error, maxWait time.Duration, ready func(idle, elapsed time.Duration) bool) (bool, error) {
 	start := time.Now()
 	deadline := time.After(maxWait)
 	ticker := time.NewTicker(codexPollInterval)
@@ -606,7 +604,7 @@ func codexAwait(ctx context.Context, cmd *exec.Cmd, ptmx *os.File, output *limit
 		case err := <-done:
 			return true, codexInteractiveErr(err, output)
 		case <-ctx.Done():
-			return true, codexInteractiveCancel(ctx, cmd, ptmx, done, output)
+			return true, codexInteractiveCancel(ctx, sess, done, output)
 		case <-deadline:
 			return false, nil
 		case <-ticker.C:
@@ -618,27 +616,25 @@ func codexAwait(ctx context.Context, cmd *exec.Cmd, ptmx *os.File, output *limit
 	}
 }
 
-func codexInteractiveStop(ctx context.Context, cmd *exec.Cmd, ptmx *os.File, done <-chan error, output *limitedBuffer) error {
+func codexInteractiveStop(ctx context.Context, sess terminal.Session, done <-chan error, output *limitedBuffer) error {
 	deadline := time.After(codexExitGrace)
 	ticker := time.NewTicker(codexExitGrace / 2)
 	defer ticker.Stop()
 
 	for sent := false; ; {
 		if !sent {
-			_, _ = ptmx.Write([]byte{0x03})
+			_, _ = sess.Write([]byte{0x03})
 			sent = true
 		}
 		select {
 		case <-done:
 			return nil
 		case <-ctx.Done():
-			return codexInteractiveCancel(ctx, cmd, ptmx, done, output)
+			return codexInteractiveCancel(ctx, sess, done, output)
 		case <-ticker.C:
-			_, _ = ptmx.Write([]byte{0x03})
+			_, _ = sess.Write([]byte{0x03})
 		case <-deadline:
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
+			_ = sess.Kill()
 			select {
 			case <-done:
 			case <-time.After(time.Second):
@@ -659,11 +655,9 @@ func codexInteractiveErr(err error, output *limitedBuffer) error {
 	return fmt.Errorf("codex interactive failed: %w: %s", err, tail)
 }
 
-func codexInteractiveCancel(ctx context.Context, cmd *exec.Cmd, ptmx *os.File, done <-chan error, output *limitedBuffer) error {
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
-	_ = ptmx.Close()
+func codexInteractiveCancel(ctx context.Context, sess terminal.Session, done <-chan error, output *limitedBuffer) error {
+	_ = sess.Kill()
+	_ = sess.Close()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
